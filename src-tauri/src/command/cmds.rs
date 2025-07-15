@@ -1,6 +1,7 @@
 use crate::command::model::ServerState;
 use base64::prelude::*;
 use futures::StreamExt;
+use notify_rust::Notification;
 use reqwest::Client;
 use serde::Serialize;
 use std::env;
@@ -20,7 +21,6 @@ use tauri::{
     path::BaseDirectory, utils::config::WindowConfig, AppHandle, Emitter, LogicalSize, Manager,
 };
 use tauri_plugin_http::reqwest;
-use tauri_plugin_notification::NotificationExt;
 use tokio::time::{sleep, Duration};
 use walkdir::WalkDir;
 use warp::Filter;
@@ -662,13 +662,38 @@ pub struct NotificationParams {
 
 #[tauri::command]
 pub fn notification(app: AppHandle, params: NotificationParams) -> Result<(), String> {
-    app.notification()
-        .builder()
-        .title(&params.title)
-        .body(&params.body)
-        .icon(&params.icon)
-        .show()
-        .unwrap();
+    let mut notifi_app = Notification::new();
+    #[cfg(target_os = "macos")]
+    {
+        let _ = notify_rust::set_application(if tauri::is_dev() {
+            "com.apple.Terminal"
+        } else {
+            &app.config().identifier
+        });
+    }
+    #[cfg(windows)]
+    {
+        use std::path::MAIN_SEPARATOR as SEP;
+        let curr_dir = get_exe_dir(true);
+        // set the notification's System.AppUserModel.ID only when running the installed app
+        if !(curr_dir.ends_with(format!("{SEP}target{SEP}debug").as_str())
+            || curr_dir.ends_with(format!("{SEP}target{SEP}release").as_str()))
+        {
+            notifi_app.app_id(&app.config().identifier);
+        }
+    }
+    if !params.icon.is_empty() {
+        notifi_app.icon(&params.icon);
+    } else {
+        notifi_app.auto_icon();
+    }
+    tauri::async_runtime::spawn(async move {
+        let _ = notifi_app
+            .summary(&params.title)
+            .body(&params.body)
+            .show()
+            .expect("show notification failed");
+    });
     Ok(())
 }
 
@@ -869,11 +894,13 @@ pub async fn macos_build(
     sleep(Duration::from_secs(10)).await;
     let man_path = base_path.join("Contents/MacOS/config/man");
     fs::write(man_path, config).expect("write man failed");
-    let _ = png_to_icns(
-        base64_png.replace("data:image/png;base64,", ""),
-        resources_dir.to_str().unwrap().to_string(),
-    )
-    .expect("convert png to icns failed");
+    if !base64_png.is_empty() {
+        let _ = png_to_icns(
+            base64_png.replace("data:image/png;base64,", ""),
+            resources_dir.to_str().unwrap().to_string(),
+        )
+        .expect("convert png to icns failed");
+    }
     let base_app = Path::new(base_dir).join(format!("{}.app", exe_name));
     if base_app.exists() {
         fs::remove_dir_all(&base_app).expect("delete old app failed");
@@ -898,6 +925,7 @@ pub async fn linux_build(
 pub async fn build_local(
     handle: AppHandle,
     target_dir: &str,
+    project_name: &str,
     exe_name: &str,
     config: WindowConfig,
     base64_png: String,
@@ -917,10 +945,13 @@ pub async fn build_local(
         serde_json::from_str::<serde_json::Value>(&man_json).expect("parse man.json failed");
     man_json["window"] = serde_json::to_value(config).unwrap();
     man_json["debug"] = serde_json::to_value(debug).unwrap();
+    man_json["name"] = serde_json::to_value(project_name).unwrap();
     #[cfg(target_os = "windows")]
     {
-        man_json["icon"] =
-            serde_json::to_value(base64_png.replace("data:image/png;base64,", "")).unwrap();
+        if !base64_png.is_empty() {
+            man_json["icon"] =
+                serde_json::to_value(base64_png.replace("data:image/png;base64,", "")).unwrap();
+        }
     }
     let man_json_base64 = BASE64_STANDARD.encode(man_json.to_string());
     handle.emit("local-progress", "40").unwrap();
